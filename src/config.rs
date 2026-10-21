@@ -67,7 +67,8 @@ lazy_static::lazy_static! {
     static ref STATUS: RwLock<Status> = RwLock::new(Status::load());
     static ref TRUSTED_DEVICES: RwLock<(Vec<TrustedDevice>, bool)> = Default::default();
     static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
-    pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("server.relay.systemdesk.net".to_owned());
+    // No server is written here: the app puts the servers of its build in force at start-up (src/sd_servers.rs).
+    pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new(String::new());
     pub static ref EXE_RENDEZVOUS_SERVER: RwLock<String> = Default::default();
     pub static ref APP_NAME: RwLock<String> = RwLock::new("SystemDesk".to_owned());
     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
@@ -114,8 +115,9 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["server.relay.systemdesk.net"];
-pub const RS_PUB_KEY: &str = "Qn3fIvFKFMkeN9hsNJfUyNrbVmQ8jkbuAKuZP7LKcQ4=";
+// Nothing is written here either (one empty entry: callers index [0]); see PROD_RENDEZVOUS_SERVER.
+pub const RENDEZVOUS_SERVERS: &[&str] = &[""];
+pub const RS_PUB_KEY: &str = "";
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
