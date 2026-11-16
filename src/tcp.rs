@@ -12,7 +12,15 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, DerefMut},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
+};
+use tokio_rustls::{
+    rustls::{
+        crypto::SupportedKxGroup, pki_types::ServerName, CipherSuite, ClientConfig,
+        ProtocolVersion, ServerConfig, SupportedCipherSuite,
+    },
+    TlsAcceptor, TlsConnector,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -29,6 +37,12 @@ pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 /// into one per direction, the way Noise splits its cipher states after the handshake, binds
 /// the handshake transcript into both, and keeps the nonce layout.
 pub const KX_VERSION_LATEST: u32 = 1;
+
+/// Version 2 is not a key for `Encrypt` at all: the two computers run TLS 1.3 on the stream
+/// itself (see `FramedStream::upgrade_tls_client`). It is advertised and picked only for a
+/// peer connection on a TCP-framed stream; `kx_version_for` never returns it, so every
+/// other exchange keeps the version-1 scheme.
+pub const KX_VERSION_TLS: u32 = 2;
 
 /// Prefix of what the server signs as `KxParams`. The same key signs other messages, and a
 /// protobuf carries no type of its own, so the prefix is what keeps them apart.
@@ -58,6 +72,31 @@ pub struct KxTranscript<'a> {
     pub picked: u32,
 }
 
+/// "TLS_AES_256_GCM_SHA384 TLSv1.3 Kx=X25519 Au=Ed25519 Enc=AESGCM(256) Mac=AEAD": what the
+/// connection panel shows beside the fingerprint. Only the two suites this app offers are named.
+fn tls_summary(
+    suite: Option<SupportedCipherSuite>,
+    version: Option<ProtocolVersion>,
+    kx: Option<&'static dyn SupportedKxGroup>,
+) -> String {
+    let (name, enc) = match suite.map(|s| s.suite()) {
+        Some(CipherSuite::TLS13_AES_256_GCM_SHA384) => ("TLS_AES_256_GCM_SHA384", "AESGCM(256)"),
+        Some(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256) => {
+            ("TLS_CHACHA20_POLY1305_SHA256", "CHACHA20/POLY1305(256)")
+        }
+        _ => ("unknown cipher", "unknown"),
+    };
+    let version = if version == Some(ProtocolVersion::TLSv1_3) {
+        "TLSv1.3"
+    } else {
+        "unknown version"
+    };
+    let kx = kx
+        .map(|g| format!("{:?}", g.name()))
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!("{name} {version} Kx={kx} Au=Ed25519 Enc={enc} Mac=AEAD")
+}
+
 /// The sending key, the send and receive counters, and the receiving key where it differs.
 #[derive(Clone)]
 pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>);
@@ -67,6 +106,8 @@ pub struct FramedStream(
     pub SocketAddr,
     pub Option<Encrypt>,
     pub u64,
+    /// What the TLS layer under this stream negotiated, once `upgrade_tls_*` has run.
+    pub Option<String>,
 );
 
 impl Deref for FramedStream {
@@ -138,6 +179,7 @@ impl FramedStream {
                         addr,
                         None,
                         0,
+                        None,
                     ));
                 }
             }
@@ -172,6 +214,7 @@ impl FramedStream {
             addr,
             None,
             0,
+            None,
         )
     }
 
@@ -181,7 +224,60 @@ impl FramedStream {
     }
 
     pub fn is_secured(&self) -> bool {
-        self.2.is_some()
+        self.2.is_some() || self.4.is_some()
+    }
+
+    /// Takes the plain byte stream out for a TLS handshake. Nothing may be waiting in either
+    /// buffer: the exchange that leads here is strictly request and answer, so a leftover means
+    /// the peer is not following it. Until the handshake finishes the stream is a dead one.
+    fn take_plain_io(&mut self) -> ResultType<(DynTcpStream, BytesCodec)> {
+        let dead = DynTcpStream(Box::new(tokio::io::join(tokio::io::empty(), tokio::io::sink())));
+        let parts = std::mem::replace(&mut self.0, Framed::new(dead, BytesCodec::new())).into_parts();
+        if !parts.read_buf.is_empty() || !parts.write_buf.is_empty() {
+            bail!("TLS handshake with bytes still pending on the stream");
+        }
+        Ok((parts.io, parts.codec))
+    }
+
+    /// Runs TLS 1.3 as the client on this stream and keeps framing the messages on top of it.
+    pub async fn upgrade_tls_client(
+        &mut self,
+        config: Arc<ClientConfig>,
+        name: ServerName<'static>,
+        ms_timeout: u64,
+    ) -> ResultType<()> {
+        let (io, codec) = self.take_plain_io()?;
+        let tls = super::timeout(ms_timeout, TlsConnector::from(config).connect(name, io)).await??;
+        let conn = tls.get_ref().1;
+        self.4 = Some(tls_summary(
+            conn.negotiated_cipher_suite(),
+            conn.protocol_version(),
+            conn.negotiated_key_exchange_group(),
+        ));
+        self.0 = Framed::new(DynTcpStream(Box::new(tls)), codec);
+        Ok(())
+    }
+
+    /// Runs TLS 1.3 as the server on this stream and keeps framing the messages on top of it.
+    pub async fn upgrade_tls_server(
+        &mut self,
+        config: Arc<ServerConfig>,
+        ms_timeout: u64,
+    ) -> ResultType<()> {
+        let (io, codec) = self.take_plain_io()?;
+        let tls = super::timeout(ms_timeout, TlsAcceptor::from(config).accept(io)).await??;
+        let conn = tls.get_ref().1;
+        self.4 = Some(tls_summary(
+            conn.negotiated_cipher_suite(),
+            conn.protocol_version(),
+            conn.negotiated_key_exchange_group(),
+        ));
+        self.0 = Framed::new(DynTcpStream(Box::new(tls)), codec);
+        Ok(())
+    }
+
+    pub fn tls_info(&self) -> Option<&str> {
+        self.4.as_deref()
     }
 
     #[inline]

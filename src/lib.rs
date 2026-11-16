@@ -63,6 +63,7 @@ pub mod websocket;
 pub mod webrtc;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use rustls_platform_verifier;
+pub use tokio_rustls;
 pub use stream::Stream;
 pub use whoami;
 pub mod tls;

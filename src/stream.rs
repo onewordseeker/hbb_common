@@ -105,6 +105,53 @@ impl Stream {
         }
     }
 
+    /// Whether TLS can run on this stream (key exchange version 2): only a TCP-framed one, which
+    /// includes the relay and the KCP path. WebSocket is already wss and WebRTC already DTLS.
+    #[inline]
+    pub fn can_upgrade_tls(&self) -> bool {
+        matches!(self, Stream::Tcp(_))
+    }
+
+    #[inline]
+    pub async fn upgrade_tls_client(
+        &mut self,
+        config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
+        name: tokio_rustls::rustls::pki_types::ServerName<'static>,
+        ms_timeout: u64,
+    ) -> ResultType<()> {
+        match self {
+            Stream::Tcp(s) => s.upgrade_tls_client(config, name, ms_timeout).await,
+            _ => bail!("TLS runs on TCP-framed streams only"),
+        }
+    }
+
+    #[inline]
+    pub async fn upgrade_tls_server(
+        &mut self,
+        config: std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
+        ms_timeout: u64,
+    ) -> ResultType<()> {
+        match self {
+            Stream::Tcp(s) => s.upgrade_tls_server(config, ms_timeout).await,
+            _ => bail!("TLS runs on TCP-framed streams only"),
+        }
+    }
+
+    /// What encrypts this stream, for the connection panel: the TLS suite when TLS runs on it,
+    /// else the cipher of the key exchange versions 0 and 1. `None` while nothing encrypts it.
+    pub fn encryption_info(&self) -> Option<String> {
+        const NACL: &str = "XSalsa20-Poly1305 (libsodium secretbox)";
+        match self {
+            #[cfg(feature = "webrtc")]
+            Stream::WebRTC(s) => s.is_secured().then(|| "DTLS (WebRTC)".to_owned()),
+            Stream::WebSocket(s) => s.is_secured().then(|| NACL.to_owned()),
+            Stream::Tcp(s) => match s.tls_info() {
+                Some(info) => Some(info.to_owned()),
+                None => s.is_secured().then(|| NACL.to_owned()),
+            },
+        }
+    }
+
     /// An opaque token that changes whenever bytes have arrived from the peer, a fragment of a
     /// message that is still incomplete included. Compare successive samples; the value itself
     /// means nothing. `None` where the transport reports no such thing.
